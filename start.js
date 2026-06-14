@@ -1,35 +1,57 @@
 #!/usr/bin/env node
 /**
- * Summarizer — Desktop File Organizer
- * Launches the EventMath API server + static UI on a single port.
+ * Summarizer — EventMath Desktop File Organizer
  * 
- * API:     GET  /api/groups       — scan desktop, return grouped files
- *          POST /api/delete       — delete single file { path }
- *          POST /api/delete-group — delete group { paths: [...] }
- * UI:      GET  /                — web interface
+ * ARCHITECTURE:
+ *   - EventMath server (summarizer.js) handles GET API on port 3001
+ *   - This wrapper serves HTML UI + handles POST operations on port 3003
+ *   - GET /api/* calls are proxied to the EventMath server
+ *   - POST /api/* (delete) happens directly in this wrapper
  */
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
+const { spawn } = require('child_process');
 
-const PORT = process.env.PORT || 3003;
-const SCANNER = path.join(__dirname, 'scanner.js');
+const EVENTMATH_PORT = 3001;
+const UI_PORT = process.env.PORT || 3003;
 const INDEX_HTML = path.join(__dirname, 'index.html');
 
+// ── Start EventMath server as a child process ──
+
+function startEventMathServer() {
+  const emProcess = spawn('node', [path.join(__dirname, 'summarizer.js')], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, PORT: String(EVENTMATH_PORT) }
+  });
+  emProcess.stdout.on('data', d => process.stdout.write(`  [EventMath] ${d}`));
+  emProcess.stderr.on('data', d => process.stderr.write(`  [EventMath] ${d}`));
+  emProcess.on('exit', (code) => {
+    console.log(`  EventMath server exited (code ${code})`);
+  });
+  console.log(`  EventMath API → http://localhost:${EVENTMATH_PORT}`);
+  return emProcess;
+}
+
+// ── Helpers ──
+
 function readBody(req) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     let body = '';
     req.on('data', c => body += c);
     req.on('end', () => {
       try { resolve(JSON.parse(body)); } catch { resolve({}); }
     });
-    req.on('error', reject);
+    req.on('error', () => resolve({}));
   });
 }
 
 function json(res, data, status = 200) {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*'
+  });
   res.end(JSON.stringify(data));
 }
 
@@ -38,56 +60,73 @@ function html(res, content, status = 200) {
   res.end(content);
 }
 
-function err(res, msg, status = 500) {
-  json(res, { ok: false, error: msg }, status);
+// ── Proxy to EventMath server ──
+
+function proxyToEventMath(method, _path, res) {
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'localhost',
+      port: EVENTMATH_PORT,
+      path: _path,
+      method: method,
+      headers: { 'Content-Type': 'application/json' }
+    };
+
+    const proxyReq = http.request(options, (proxyRes) => {
+      let data = '';
+      proxyRes.on('data', c => data += c);
+            proxyRes.on('end', () => {
+              try {
+                const parsed = JSON.parse(data);
+                // EventMath spawn returns { stdout, stderr, exitCode, protocol_info }
+                // Extract the actual JSON from stdout if present
+                if (parsed.stdout && parsed.stdout.trim()) {
+                  try {
+                    const inner = JSON.parse(parsed.stdout);
+                    json(res, inner, proxyRes.statusCode);
+                  } catch {
+                    // stdout isn't JSON, return raw spawn result
+                    json(res, parsed, proxyRes.statusCode);
+                  }
+                } else {
+                  json(res, parsed, proxyRes.statusCode);
+                }
+              } catch {
+                res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
+                res.end(data);
+              }
+              resolve(true);
+      });
+    });
+
+    proxyReq.on('error', (e) => {
+      json(res, { ok: false, error: `EventMath unavailable: ${e.message}` }, 503);
+      resolve(true);
+    });
+
+    proxyReq.end();
+  });
 }
 
-async function handleAPI(method, _path, req, res) {
-  // GET /api/groups — scan desktop
-  if (method === 'GET' && _path === '/api/groups') {
-    try {
-      const { spawn } = require('child_process');
-      const child = spawn('node', [SCANNER], { stdio: ['ignore', 'pipe', 'pipe'] });
-      let stdout = '', stderr = '';
-      child.stdout.on('data', d => stdout += d);
-      child.stderr.on('data', d => stderr += d);
-      await new Promise(r => child.on('close', r));
+// ── Direct POST handlers ──
 
-      if (child.exitCode !== 0) {
-        return err(res, `Scanner failed: ${stderr.trim()}`);
-      }
-      json(res, JSON.parse(stdout));
+async function handlePostAPI(_path, req, res) {
+  const body = await readBody(req);
+
+  if (_path === '/api/delete') {
+    if (!body.path) return json(res, { ok: false, error: 'Missing path' }, 400);
+    try {
+      fs.unlinkSync(body.path);
+      json(res, { ok: true, deleted: body.path });
     } catch (e) {
-      err(res, e.message);
+      json(res, { ok: false, error: `Cannot delete: ${e.message}` }, 500);
     }
     return true;
   }
 
-  // POST /api/delete — delete a single file
-  if (method === 'POST' && _path === '/api/delete') {
-    const body = await readBody(req);
-    const filePath = body.path;
-    if (!filePath) return err(res, 'Missing path', 400);
-    try {
-      fs.unlinkSync(filePath);
-      json(res, { ok: true, deleted: filePath });
-    } catch (e) {
-      err(res, `Cannot delete: ${e.message}`);
-    }
-    return true;
-  }
-
-  // GET /api/health
-  if (method === 'GET' && _path === '/api/health') {
-    json(res, { ok: true, version: '1.0', status: 'running' });
-    return true;
-  }
-
-  // POST /api/delete-group — delete multiple files
-  if (method === 'POST' && _path === '/api/delete-group') {
-    const body = await readBody(req);
+  if (_path === '/api/delete-group') {
     const paths = body.paths || [];
-    if (!paths.length) return err(res, 'Missing paths', 400);
+    if (!paths.length) return json(res, { ok: false, error: 'Missing paths' }, 400);
     const results = [];
     for (const p of paths) {
       try {
@@ -97,34 +136,38 @@ async function handleAPI(method, _path, req, res) {
         results.push({ path: p, ok: false, error: e.message });
       }
     }
-    json(res, { ok: true, deleted: results.filter(r => r.ok).length, failed: results.filter(r => !r.ok).length, results });
+    json(res, {
+      ok: true,
+      deleted: results.filter(r => r.ok).length,
+      failed: results.filter(r => !r.ok).length,
+      results
+    });
     return true;
   }
 
   return false;
 }
 
-// ── Server ──
-http.createServer(async (req, res) => {
+// ── Main Server ──
+
+const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url);
   const _path = parsed.pathname;
   const method = req.method.toUpperCase();
 
-  // CORS headers
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  if (method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  // API routes
   if (_path.startsWith('/api/')) {
-    const handled = await handleAPI(method, _path, req, res);
-    if (!handled) json(res, { ok: false, error: 'Not found' }, 404);
+    if (method === 'POST') {
+      const handled = await handlePostAPI(_path, req, res);
+      if (!handled) json(res, { ok: false, error: 'Not found' }, 404);
+    } else {
+      await proxyToEventMath(method, _path, res);
+    }
     return;
   }
 
@@ -132,16 +175,29 @@ http.createServer(async (req, res) => {
   try {
     const content = fs.readFileSync(INDEX_HTML, 'utf-8');
     html(res, content);
-  } catch (e) {
-    html(res, `
-      <html><body style="font-family:sans-serif;background:#1a1a2e;color:#e0e0e0;padding:40px">
+  } catch {
+    html(res, `<html style="background:#0d1117;color:#e6edf3;padding:40px;font-family:sans-serif">
       <h1>📁 Summarizer</h1>
-      <p>Server running on port ${PORT}</p>
-      <p>API: <a href="/api/groups" style="color:#4fc3f7">/api/groups</a></p>
-      <p style="color:#8b949e">index.html not found — create it alongside start.js</p>
-      </body></html>
-    `);
+      <p>Running on port ${UI_PORT}</p>
+      <p><a href="/api/groups" style="color:#4fc3f7">/api/groups</a></p>
+    </html>`);
   }
-}).listen(PORT, () => {
-  console.log(`📁 Summarizer → http://localhost:${PORT}`);
+});
+
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error(`Port ${UI_PORT} in use. Try: PORT=3004 node start.js`);
+  } else {
+    console.error(e);
+  }
+  process.exit(1);
+});
+
+server.listen(UI_PORT, () => {
+  console.log('');
+  console.log('  📁 Summarizer');
+  console.log('  ═══════════════');
+  console.log(`  UI → http://localhost:${UI_PORT}`);
+  startEventMathServer();
+  console.log('');
 });

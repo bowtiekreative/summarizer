@@ -3,19 +3,17 @@
 
 const EM = typeof EventMathRuntime !== 'undefined'
   ? EventMathRuntime
-  : require('..\eventmath2026\runtime\eventmath-runtime.js');
+  : require('../eventmath2026/runtime/eventmath-runtime.js');
 
 const __weights = {};
 const __assumptions = [];
 
-let port = null;
-let groups = null;
+const __emMachine = require('../eventmath2026/runtime/eventmath-machine-runtime.js');
 
-// star (constant): port
-port = 3001;
+let api_port = null;
 
-// rain: groups
-groups = null;
+// star (constant): api port
+api_port = 3001;
 
 require('node:http').createServer(async function(req, res) {
   var _method = req.method.toLowerCase();
@@ -29,24 +27,14 @@ require('node:http').createServer(async function(req, res) {
     return;
   }
   if (_method === "get" && _path === "/api/health") {
-    // spawn: node -e console.log(JSON.stringify({ok:true,version:'1.0'}))
-    health = await __emMachine.spawnProcess("node -e console.log(JSON.stringify({ok:true,version:'1.0'}))");
+    // spawn: node -e console.log(JSON.stringify({running:true,version:'1.0'}))
+    info = await __emMachine.spawnProcess("node -e console.log(JSON.stringify({running:true,version:'1.0'}))");
     
     res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify(health));
-    return;
-  }
-  if (_method === "post" && _path === "/api/delete") {
-    res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify(_ok_true_message_use_startjs_wrapper_for_file_operations_));
-    return;
-  }
-  if (_method === "post" && _path === "/api/delete-group") {
-    res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify(_ok_true_message_use_startjs_wrapper_for_file_operations_));
+    res.end(JSON.stringify(info));
     return;
   }
   res.writeHead(404); res.end('Not found');
-}).listen(3000, function() {
-  console.log('EventMath: serving on port 3000');
+}).listen(api_port, function() {
+  console.log('EventMath: serving on port ' + api_port);
 });
